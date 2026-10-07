@@ -1,0 +1,397 @@
+name: Build 全剧视界 TV 优化版 32-bit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-tv-optimized-armv7.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONUTF8: "1"
+
+jobs:
+  android-tv-optimized:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout upstream 1.0.5+79
+        uses: actions/checkout@v4
+        with:
+          repository: mick303/guoapp2
+          ref: 11e155b01d8c65c83626ee1793d68389b1a06090
+          path: src
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/native/go.mod
+          cache-dependency-path: src/native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.4"
+          channel: stable
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: Apply Xiaomi TV optimizations
+        working-directory: src
+        shell: python
+        run: |
+          from pathlib import Path
+
+          # Distinct package/name so it can coexist with the phone build.
+          gradle = Path("android/app/build.gradle.kts")
+          text = gradle.read_text(encoding="utf-8")
+          text = text.replace(
+              'applicationId = "com.duanju.duanju_app"',
+              'applicationId = "com.duanju.duanju_app.tvopt32"',
+              1,
+          )
+          text = text.replace(
+              'manifestPlaceholders["appLabel"] = if (allSources) "全剧视界" else "短剧视界"',
+              'manifestPlaceholders["appLabel"] = if (allSources) "全剧视界TV优化版" else "短剧视界TV优化版"',
+              1,
+          )
+          gradle.write_text(text, encoding="utf-8")
+
+          # Force-show Android TV IME when the Flutter search field is focused.
+          activity = Path("android/app/src/main/kotlin/com/duanju/duanju_app/MainActivity.kt")
+          text = activity.read_text(encoding="utf-8")
+          if "android.view.inputmethod.InputMethodManager" not in text:
+              text = text.replace(
+                  "import android.view.InputDevice\n",
+                  "import android.view.InputDevice\nimport android.view.inputmethod.InputMethodManager\nimport android.view.WindowManager\n",
+                  1,
+              )
+          marker = '                    when (call.method) {\n                        "deviceInfo" -> {'
+          replacement = '''                    when (call.method) {
+                        "showKeyboard" -> {
+                            val view = currentFocus ?: window.decorView
+                            view.requestFocus()
+                            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+                            val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                            val shown = manager.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+                            result.success(shown)
+                        }
+                        "deviceInfo" -> {'''
+          if marker not in text:
+              raise SystemExit("MainActivity method-channel marker not found")
+          text = text.replace(marker, replacement, 1)
+          activity.write_text(text, encoding="utf-8")
+
+          # TV search: explicitly request the system keyboard and provide a remote-friendly fallback keyboard.
+          remote = Path("lib/remote_widgets.dart")
+          text = remote.read_text(encoding="utf-8")
+          start = text.index("class _TelevisionSearchDialogState extends State<TelevisionSearchDialog> {")
+          new_tail = r'''class _TelevisionSearchDialogState extends State<TelevisionSearchDialog> {
+            late final _controller = TextEditingController(text: widget.initialValue);
+            bool _showFallbackKeyboard = true;
+
+            static const _keys = <String>[
+              'A','B','C','D','E','F','G','H',
+              'I','J','K','L','M','N','O','P',
+              'Q','R','S','T','U','V','W','X',
+              'Y','Z','0','1','2','3','4','5',
+              '6','7','8','9',
+            ];
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) _showSystemKeyboard();
+              });
+            }
+
+            Future<void> _showSystemKeyboard() async {
+              try {
+                await SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+              } catch (_) {}
+              try {
+                await const MethodChannel('duanju/device').invokeMethod<bool>('showKeyboard');
+              } catch (_) {}
+            }
+
+            void _append(String value) {
+              final old = _controller.value;
+              final selection = old.selection.isValid
+                  ? old.selection
+                  : TextSelection.collapsed(offset: old.text.length);
+              final start = selection.start.clamp(0, old.text.length);
+              final end = selection.end.clamp(0, old.text.length);
+              final next = old.text.replaceRange(start, end, value);
+              final cursor = start + value.length;
+              _controller.value = TextEditingValue(
+                text: next,
+                selection: TextSelection.collapsed(offset: cursor),
+              );
+              setState(() {});
+            }
+
+            void _backspace() {
+              final old = _controller.value;
+              if (old.text.isEmpty) return;
+              final selection = old.selection.isValid
+                  ? old.selection
+                  : TextSelection.collapsed(offset: old.text.length);
+              var start = selection.start.clamp(0, old.text.length);
+              final end = selection.end.clamp(0, old.text.length);
+              if (start == end && start > 0) start--;
+              final next = old.text.replaceRange(start, end, '');
+              _controller.value = TextEditingValue(
+                text: next,
+                selection: TextSelection.collapsed(offset: start),
+              );
+              setState(() {});
+            }
+
+            Widget _fallbackKey(String label, VoidCallback onPressed) => SizedBox(
+              height: 44,
+              child: OutlinedButton(
+                onPressed: onPressed,
+                child: Text(label, style: const TextStyle(fontSize: 16)),
+              ),
+            );
+
+            @override
+            void dispose() {
+              _controller.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) => AlertDialog(
+              title: Text(widget.title),
+              content: SizedBox(
+                width: 720,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.sizeOf(context).height * .76,
+                  ),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SearchInput(
+                          autofocus: true,
+                          controller: _controller,
+                          hint: '输入剧名',
+                          suggestions: widget.suggestions,
+                          onCancel: widget.onCancel,
+                          onSearch: (value) => Navigator.pop(context, value),
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: FilledButton.icon(
+                                onPressed: _showSystemKeyboard,
+                                icon: const Icon(Icons.keyboard_rounded),
+                                label: const Text('呼出电视中文键盘'),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            OutlinedButton.icon(
+                              onPressed: () => setState(
+                                () => _showFallbackKeyboard = !_showFallbackKeyboard,
+                              ),
+                              icon: Icon(
+                                _showFallbackKeyboard
+                                    ? Icons.keyboard_hide_rounded
+                                    : Icons.keyboard_alt_outlined,
+                              ),
+                              label: Text(_showFallbackKeyboard ? '隐藏按键' : '显示按键'),
+                            ),
+                          ],
+                        ),
+                        if (_showFallbackKeyboard) ...[
+                          const SizedBox(height: 12),
+                          GridView.count(
+                            crossAxisCount: 8,
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            mainAxisSpacing: 6,
+                            crossAxisSpacing: 6,
+                            childAspectRatio: 1.8,
+                            children: [
+                              for (final key in _keys)
+                                _fallbackKey(key, () => _append(key.toLowerCase())),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Expanded(child: _fallbackKey('空格', () => _append(' '))),
+                              const SizedBox(width: 8),
+                              Expanded(child: _fallbackKey('删除', _backspace)),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: _fallbackKey(
+                                  '清空',
+                                  () {
+                                    _controller.clear();
+                                    setState(() {});
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                        if (widget.recentSearches.isNotEmpty) ...[
+                          const SizedBox(height: 16),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              '最近搜索',
+                              style: Theme.of(context).textTheme.titleSmall,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              for (final query in widget.recentSearches)
+                                ActionChip(
+                                  label: Text(query),
+                                  avatar: const Icon(Icons.history_rounded, size: 16),
+                                  onPressed: () => Navigator.pop(context, query),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('取消'),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.pop(context, ''),
+                  child: const Text('清空'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, _controller.text.trim()),
+                  child: const Text('搜索'),
+                ),
+              ],
+            );
+          }
+          '''
+          remote.write_text(text[:start] + new_tail, encoding="utf-8")
+
+          # Reduce 4K-TV image decode cost and focus animation overhead.
+          widgets = Path("lib/widgets.dart")
+          text = widgets.read_text(encoding="utf-8")
+          text = text.replace(
+              "        cacheWidth: 440,",
+              "        cacheWidth: AppLayout.isTelevision(context) ? 280 : 440,",
+              1,
+          )
+          widgets.write_text(text, encoding="utf-8")
+
+          remote = Path("lib/remote_widgets.dart")
+          text = remote.read_text(encoding="utf-8")
+          text = text.replace(
+              "            duration: const Duration(milliseconds: 120),",
+              "            duration: AppLayout.isTelevision(context) ? Duration.zero : const Duration(milliseconds: 120),",
+              1,
+          )
+          text = text.replace(
+              "    child: CustomScrollView(\n      controller: _scroll,",
+              "    child: CustomScrollView(\n      controller: _scroll,\n      cacheExtent: AppLayout.isTelevision(context) ? 120 : null,",
+              1,
+          )
+          remote.write_text(text, encoding="utf-8")
+
+          # Fewer cards on screen reduces simultaneous image decode/layout work on 4K TVs.
+          home = Path("lib/home_screen.dart")
+          text = home.read_text(encoding="utf-8")
+          old = "    final columns = ((width - 36) / 150).floor().clamp(1, 8);"
+          new = "    final columns = ((width - 36) / 210).floor().clamp(1, 6);"
+          if old not in text:
+              raise SystemExit("TV grid column expression not found")
+          text = text.replace(old, new, 1)
+          home.write_text(text, encoding="utf-8")
+
+          # Constrain Flutter image cache for the 32-bit TV process.
+          main = Path("lib/main.dart")
+          text = main.read_text(encoding="utf-8")
+          marker = "  final device = await AppDevice.detect();\n  runApp(AppBootstrap(device: device));"
+          replacement = """  final device = await AppDevice.detect();
+          if (device.television) {
+            PaintingBinding.instance.imageCache.maximumSize = 80;
+            PaintingBinding.instance.imageCache.maximumSizeBytes = 48 * 1024 * 1024;
+          }
+          runApp(AppBootstrap(device: device));"""
+          if marker not in text:
+              raise SystemExit("main.dart device marker not found")
+          text = text.replace(marker, replacement, 1)
+          main.write_text(text, encoding="utf-8")
+
+      - name: Format patched Dart files
+        working-directory: src
+        run: dart format lib/remote_widgets.dart lib/widgets.dart lib/home_screen.dart lib/main.dart
+
+      - name: Configure preview signing
+        working-directory: src
+        run: python scripts/configure_signing.py
+
+      - name: Build all-sources optimized TV APK
+        working-directory: src
+        run: python scripts/build_android.py --all-sources --abi armeabi-v7a
+
+      - name: Write build info
+        working-directory: src
+        shell: bash
+        run: |
+          {
+            echo "Edition: 全剧视界 TV 优化版"
+            echo "Upstream: mick303/guoapp2"
+            echo "Pinned commit: 11e155b01d8c65c83626ee1793d68389b1a06090"
+            echo "Base version: 1.0.5+79"
+            echo "ABI: armeabi-v7a"
+            echo "TV optimizations: 4K cover downscale, fewer grid columns, zero focus animation, smaller image cache"
+            echo "TV input: explicit Xiaomi/Android TV IME request + remote fallback keyboard"
+          } > dist/android/BUILD_INFO-TV-OPTIMIZED.txt
+
+      - name: Upload optimized TV APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: quanjushijie-1.0.5+79-tv-optimized-armeabi-v7a
+          path: |
+            src/dist/android/*.apk
+            src/dist/android/BUILD_INFO-TV-OPTIMIZED.txt
+          if-no-files-found: error
+          retention-days: 14
