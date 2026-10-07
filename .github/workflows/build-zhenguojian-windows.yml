@@ -88,6 +88,13 @@ jobs:
         shell: pwsh
         run: flutter config --enable-windows-desktop
 
+      - name: Refresh Flutter lockfile
+        shell: pwsh
+        working-directory: src
+        run: |
+          flutter pub get
+          git diff -- pubspec.lock
+
       - name: Build 真果鉴（全站源）
         shell: pwsh
         working-directory: src
