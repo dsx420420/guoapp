@@ -1,0 +1,102 @@
+name: Build 全剧视界 Windows x64
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-new-guoapp-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout newer upstream snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: mick303/guoapp2
+          ref: 11e155b01d8c65c83626ee1793d68389b1a06090
+          path: src
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/native/go.mod
+          cache-dependency-path: src/native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.4"
+          channel: stable
+          cache: true
+
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: minimal
+
+      - name: Add MinGW compiler to PATH
+        shell: pwsh
+        run: |
+          $compilerDirectory = '${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin'
+          if (-not (Test-Path -LiteralPath "$compilerDirectory\gcc.exe")) {
+            throw 'MinGW compiler was not installed'
+          }
+          $compilerDirectory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prepare Inno Setup
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          if (-not (Test-Path -LiteralPath $compiler)) {
+            throw 'Inno Setup compiler was not installed'
+          }
+          Split-Path -Parent $compiler | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build 全站源版 Windows x64
+        working-directory: src
+        run: python scripts/build_windows.py --all-sources
+
+      - name: Write build info
+        working-directory: src
+        shell: pwsh
+        run: |
+          @"
+          Upstream: mick303/guoapp2
+          Commit: 11e155b01d8c65c83626ee1793d68389b1a06090
+          Version: 1.0.5+79
+          Edition: 全剧视界 / all sources
+          Platform: Windows 10/11 x64
+          "@ | Set-Content -Path dist/windows/BUILD_INFO.txt -Encoding utf8
+
+      - name: Upload Windows x64 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: quanjushijie-1.0.5+79-windows-x64
+          path: |
+            src/dist/windows/*
+          if-no-files-found: error
+          retention-days: 14
