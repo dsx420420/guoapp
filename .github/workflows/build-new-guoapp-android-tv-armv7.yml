@@ -1,0 +1,113 @@
+name: Build 全剧视界 Android TV 32-bit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-new-guoapp-android-tv-armv7.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONUTF8: "1"
+
+jobs:
+  android-tv-32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout newer upstream snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: mick303/guoapp2
+          ref: 11e155b01d8c65c83626ee1793d68389b1a06090
+          path: src
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/native/go.mod
+          cache-dependency-path: src/native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.4"
+          channel: stable
+          cache: true
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: Make TV test build install side-by-side
+        working-directory: src
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path("android/app/build.gradle.kts")
+          text = path.read_text(encoding="utf-8")
+          old = 'applicationId = "com.duanju.duanju_app"'
+          new = 'applicationId = "com.duanju.duanju_app.tvtest32"'
+          if old not in text:
+              raise SystemExit("applicationId line not found")
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              'manifestPlaceholders["appLabel"] = if (allSources) "全剧视界" else "短剧视界"',
+              'manifestPlaceholders["appLabel"] = if (allSources) "全剧视界TV测试版" else "短剧视界TV测试版"',
+              1,
+          )
+          path.write_text(text, encoding="utf-8")
+
+      - name: Configure preview signing
+        working-directory: src
+        run: python scripts/configure_signing.py
+
+      - name: Build all-sources 32-bit ARM APK
+        working-directory: src
+        run: python scripts/build_android.py --all-sources --abi armeabi-v7a
+
+      - name: Write build info
+        working-directory: src
+        shell: bash
+        run: |
+          {
+            echo "Purpose: Xiaomi TV / Android TV 32-bit compatibility test"
+            echo "Upstream: mick303/guoapp2"
+            echo "Pinned commit: 11e155b01d8c65c83626ee1793d68389b1a06090"
+            echo "Upstream version: 1.0.5+79"
+            echo "Edition: all sources"
+            echo "ABI: armeabi-v7a (32-bit ARM)"
+            echo "Test applicationId: com.duanju.duanju_app.tvtest32"
+            echo "TV support: Leanback launcher + remote-control UI are present in upstream."
+          } > dist/android/BUILD_INFO-TV32.txt
+
+      - name: Upload Android TV 32-bit APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: quanjushijie-1.0.5+79-tv-armeabi-v7a
+          path: |
+            src/dist/android/*.apk
+            src/dist/android/BUILD_INFO-TV32.txt
+          if-no-files-found: error
+          retention-days: 14
